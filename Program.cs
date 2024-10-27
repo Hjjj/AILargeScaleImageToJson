@@ -1,10 +1,14 @@
-﻿using Azure.AI.Vision.ImageAnalysis;
+﻿using Azure;
+using Azure.AI.Vision.ImageAnalysis;
+using Newtonsoft.Json;
 using Serilog;
 using System;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Data.SQLite;
 using System.IO;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
 
 namespace AILargeScaleImageToJson
 {
@@ -16,12 +20,14 @@ namespace AILargeScaleImageToJson
     {
         private static ImageAnalysisClient _client;
 
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             // Setup Serilog
             Log.Logger = new LoggerConfiguration()
                 .WriteTo.File("log.txt", rollingInterval: RollingInterval.Day)
                 .CreateLogger();
+
+            LogAndPrint("BEGIN BATCH");
 
             try
             {
@@ -42,15 +48,15 @@ namespace AILargeScaleImageToJson
                 VerifyDirectory(jsonFilesDirectory);
 
                 // Verify database and table
-                VerifyDatabaseAndTable(databaseFilePath);
+                string fullPathDbFile = VerifyDatabaseAndTable(databaseFilePath);
 
                 // Populate WorkQueue
-                PopulateWorkQueue(databaseFilePath, imageFilesDirectory);
+                PopulateWorkQueue(fullPathDbFile, imageFilesDirectory);
 
                 // Process WorkQueue
-                ProcessWorkQueue(databaseFilePath, jsonFilesDirectory);
+                await ProcessWorkQueue(fullPathDbFile, jsonFilesDirectory);
 
-                Log.Information("JPG to JSON Conversions Completed");
+                Log.Information("Entire Work Queue of JPG to JSON Conversions Completed");
             }
             catch (Exception ex)
             {
@@ -65,31 +71,28 @@ namespace AILargeScaleImageToJson
         {
             if (!Directory.Exists(path))
             {
+                LogAndPrint($"Dir Not Exist. Creating. {path}");
                 Directory.CreateDirectory(path);
-                Log.Information($"Directory created: {path}");
-            }
-            else
-            {
-                Log.Information($"Directory exists: {path}");
             }
         }
 
-        static void VerifyDatabaseAndTable(string databaseFilePath)
+        static string VerifyDatabaseAndTable(string databaseFilePath)
         {
-            // Ensure the directory for the database file exists
-            string databaseDirectory = Path.GetDirectoryName(databaseFilePath);
+            string workingDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            string fullDatabaseFilePath = workingDirectory + databaseFilePath.Substring(1);
+            string databaseDirectory = Path.GetDirectoryName(fullDatabaseFilePath);
 
             if (!Directory.Exists(databaseDirectory))
             {
                 Directory.CreateDirectory(databaseDirectory);
-                Log.Information($"Directory created: {databaseDirectory}");
+                LogAndPrint($"DB Dir not exist. Creating {databaseDirectory}");
             }
 
             // Open a connection to the database, which will create the file if it doesn't exist
-            using (var connection = new SQLiteConnection($"Data Source={databaseFilePath};"))
+            using (var connection = new SQLiteConnection($"Data Source={fullDatabaseFilePath};"))
             {
                 connection.Open();
-                Log.Information($"Database verified: {databaseFilePath}");
+                LogAndPrint($"Database verified at: {fullDatabaseFilePath}");
 
                 string createTableQuery = @"
             CREATE TABLE IF NOT EXISTS WorkQueue (
@@ -102,12 +105,20 @@ namespace AILargeScaleImageToJson
                 {
                     command.ExecuteNonQuery();
                     Log.Information("Verified that the WorkQueue table exists.");
+                    LogAndPrint($"DB Table 'WorkQueue' verified");
                 }
             }
+
+            return fullDatabaseFilePath;
         }
 
+        static void LogAndPrint(string info)
+        {
+            Console.WriteLine(info);
+            Log.Information(info);
+        }
 
-        static void ProcessWorkQueue(string databaseFilePath, string jsonFilesDirectory)
+        static async Task ProcessWorkQueue(string databaseFilePath, string jsonFilesDirectory)
         {
             using (var connection = new SQLiteConnection($"Data Source={databaseFilePath};Version=3;"))
             {
@@ -117,17 +128,36 @@ namespace AILargeScaleImageToJson
                 using (var command = new SQLiteCommand(selectQuery, connection))
                 using (var reader = command.ExecuteReader())
                 {
+                    int i = 0;
+                    LogAndPrint("BEGIN LOOP Processing the WorkQueue");
                     while (reader.Read())
                     {
+                        i++;
                         int id = reader.GetInt32(0);
                         string imageFileName = reader.GetString(1);
 
-                        // Process the image file (placeholder for actual AI processing)
-                        string jsonContent = ProcessImageFile(imageFileName);
+                        // Process the image file with Azure Image AI service
+                        LogAndPrint($"{i} Azure AI Image Analysis processing... {imageFileName}");
+                        var aiResult = await ProcessImageFile(imageFileName);
+
+                        if (aiResult.Value.Read is null)
+                        {
+                            //log bad ai result
+                            LogAndPrint($"{i} Skipping Bad Result from AI Service-{imageFileName}");
+                            continue;
+                        }
+
+                        string jsonResult = JsonConvert.SerializeObject(aiResult, Newtonsoft.Json.Formatting.Indented);
+                        
+                        if (string.IsNullOrEmpty(jsonResult))
+                        {
+                            LogAndPrint($"{i} Skipping Bad Json conversion for {imageFileName}");
+                            continue;
+                        }
 
                         // Save JSON content to file
                         string jsonFileName = Path.Combine(jsonFilesDirectory, Path.GetFileNameWithoutExtension(imageFileName) + ".json");
-                        File.WriteAllText(jsonFileName, jsonContent);
+                        File.WriteAllText(jsonFileName, jsonResult);
 
                         // Update WorkQueue status
                         string updateQuery = "UPDATE WorkQueue SET Status = 1 WHERE Id = @Id";
@@ -137,20 +167,27 @@ namespace AILargeScaleImageToJson
                             updateCommand.ExecuteNonQuery();
                         }
 
-                        Log.Information($"Processed image file: {imageFileName}");
+                        LogAndPrint($"{i} - Success saving JSON:{jsonFileName}");
                     }
+                    LogAndPrint($"END LOOP - Procesed {i} records in the WorkQueue.");
                 }
             }
         }
 
         private static String[] GetFileNamesInFolder(string folderPath, string[] arrayOfFileTypes)
         {
+            LogAndPrint($"Getting images in folder {folderPath}");
+
             if (folderPath == null || arrayOfFileTypes == null)
+            {
+                LogAndPrint($"Error: folderPath was blank");
                 return new string[] { };
+            }
+                
 
             if (!Directory.Exists(folderPath))
             {
-                Console.WriteLine("Invalid image directory. Value is: " + folderPath);
+                LogAndPrint($"Error: folderPath was bad: {folderPath}");
                 return new string[] { };
             }
 
@@ -163,9 +200,16 @@ namespace AILargeScaleImageToJson
                 filesFound.AddRange(Directory.GetFiles(folderPath, String.Format("*.{0}", fileType)));
             }
 
+            LogAndPrint($"Image count found in folder:{filesFound.Count}");
             return filesFound.ToArray();
         }
 
+        /// <summary>
+        /// If the workqueue has no records to process, go to the image directory and see if there are 
+        /// any images in there to be processed. if there are, add them to the workqueue table
+        /// </summary>
+        /// <param name="databaseFilePath"></param>
+        /// <param name="imageFilesDirectory"></param>
         static void PopulateWorkQueue(string databaseFilePath, string imageFilesDirectory)
         {
             using (var connection = new SQLiteConnection($"Data Source={databaseFilePath};Version=3;"))
@@ -173,12 +217,16 @@ namespace AILargeScaleImageToJson
                 connection.Open();
 
                 // Check if WorkQueue table is empty
-                string checkTableQuery = "SELECT COUNT(*) FROM WorkQueue";
+                string checkTableQuery = "SELECT COUNT(*) FROM WorkQueue WHERE Status=0";
+
                 using (var command = new SQLiteCommand(checkTableQuery, connection))
                 {
                     long count = (long)command.ExecuteScalar();
+                    LogAndPrint($"There are {count} images ready in the Work Queue");
+
                     if (count == 0)
                     {
+                        
                         var jpgFiles = GetFileNamesInFolder(imageFilesDirectory, new String[] { "jpg", "jpeg" });
 
                         foreach (var file in jpgFiles)
@@ -190,19 +238,54 @@ namespace AILargeScaleImageToJson
                                 insertCommand.ExecuteNonQuery();
                             }
                         }
-                        Log.Information("Populated WorkQueue table with image files.");
+                        LogAndPrint($"{jpgFiles.Length} images from image folder are now queued up in the work queue.");
                     }
                 }
             }
         }
 
-        static string ProcessImageFile(string imageFileName)
+        private static async Task<Response<ImageAnalysisResult>> ProcessImageFile(string imagePath)
         {
-            // Placeholder for actual AI processing
-            // This function should call the Amazon AI service and return the JSON content
-            return "{ \"example\": \"json\" }";
-        }
+            try
+            {
+                using (var imageStream = System.IO.File.OpenRead(imagePath))
+                {
+                    return await _client.AnalyzeAsync(BinaryData.FromStream(imageStream), VisualFeatures.Read);
+                }
+            }
+            catch(RequestFailedException ex)
+            {
+                // Log the error details
+                Log.Error(ex, $"Azure AI Request failed for image {imagePath}. Status: {ex.Status}, Message: {ex.Message}");
+                Console.WriteLine($"EXCEPTION: Azure AI Request failed for image {imagePath}");
 
+                // Handle specific status codes if needed
+                if (ex.Status == 403) // Forbidden
+                {
+                    Log.Error("The AI service account has likely exhausted its funding or quota.");
+                    Console.WriteLine($"AI Account possibly exhaused funding or bandwidth.");
+                }
+
+                Console.WriteLine("Press [S]kip this eCard, or [E]xit.");
+
+                while(true)
+                {
+                    var keyInfo = Console.ReadKey();
+
+                    if (keyInfo.Key == ConsoleKey.S)
+                    {
+                        return await Task.FromResult<Response<ImageAnalysisResult>>(null);
+                    }
+                    else if (keyInfo.Key == ConsoleKey.E)
+                    {
+                        //does exiting here screw up the db connections?
+                        Environment.Exit(0);
+                    }
+                }
+
+            }
+
+        }
 
     }
 }
