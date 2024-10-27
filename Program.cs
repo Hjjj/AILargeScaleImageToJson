@@ -60,7 +60,8 @@ namespace AILargeScaleImageToJson
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "An error occurred during application startup.");
+                Log.Error(ex, $"Caught in Main(). {ex.Message} {ex.InnerException}");
+                Console.WriteLine($"Caught in Main(). {ex.Message} {ex.InnerException}");
             }
 
             Console.WriteLine("Press any key to exit.");
@@ -137,13 +138,21 @@ namespace AILargeScaleImageToJson
                         string imageFileName = reader.GetString(1);
 
                         // Process the image file with Azure Image AI service
-                        LogAndPrint($"{i} Azure AI Image Analysis processing... {imageFileName}");
+                        LogAndPrint($"{i} Processing @ Azure Cognitive Services Image Analysis{imageFileName}");
                         var aiResult = await ProcessImageFile(imageFileName);
 
-                        if (aiResult.Value.Read is null)
+                        if (aiResult?.Value?.Read is null)
                         {
                             //log bad ai result
                             LogAndPrint($"{i} Skipping Bad Result from AI Service-{imageFileName}");
+
+                            // Update WorkQueue status
+                            using (var updateCommand = new SQLiteCommand("UPDATE WorkQueue SET Status = -1 WHERE Id = @Id", connection))
+                            {
+                                updateCommand.Parameters.AddWithValue("@Id", id);
+                                updateCommand.ExecuteNonQuery();
+                            }
+
                             continue;
                         }
 
@@ -257,31 +266,33 @@ namespace AILargeScaleImageToJson
             {
                 // Log the error details
                 Log.Error(ex, $"Azure AI Request failed for image {imagePath}. Status: {ex.Status}, Message: {ex.Message}");
-                Console.WriteLine($"EXCEPTION: Azure AI Request failed for image {imagePath}");
+                Console.WriteLine($"Azure AI Request failed for image {imagePath}. Status: {ex.Status}, Message: {ex.Message}");
 
                 // Handle specific status codes if needed
                 if (ex.Status == 403) // Forbidden
                 {
-                    Log.Error("The AI service account has likely exhausted its funding or quota.");
-                    Console.WriteLine($"AI Account possibly exhaused funding or bandwidth.");
-                }
+                    LogAndPrint("AI Account possibly exhaused funding or bandwidth.");
+                    Console.WriteLine("Press [S]kip this eCard, or [E]xit.");
 
-                Console.WriteLine("Press [S]kip this eCard, or [E]xit.");
-
-                while(true)
-                {
-                    var keyInfo = Console.ReadKey();
-
-                    if (keyInfo.Key == ConsoleKey.S)
+                    while (true)
                     {
-                        return await Task.FromResult<Response<ImageAnalysisResult>>(null);
-                    }
-                    else if (keyInfo.Key == ConsoleKey.E)
-                    {
-                        //does exiting here screw up the db connections?
-                        Environment.Exit(0);
+                        var keyInfo = Console.ReadKey();
+
+                        if (keyInfo.Key == ConsoleKey.S)
+                        {
+                            return await Task.FromResult<Response<ImageAnalysisResult>>(null);
+                        }
+                        else if (keyInfo.Key == ConsoleKey.E)
+                        {
+                            //does exiting here screw up the db connections? yes
+                            Environment.Exit(0);
+                        }
                     }
                 }
+
+                //some exception we don't know about happened, just return null back to the processing loop
+                //so what we can continue processing the next image in the work queue
+                return await Task.FromResult<Response<ImageAnalysisResult>>(null);
 
             }
 
