@@ -176,7 +176,20 @@ namespace AILargeScaleImageToJson
                             updateCommand.ExecuteNonQuery();
                         }
 
-                        LogAndPrint($"{i} - Success saving JSON:{jsonFileName}");
+                        LogAndPrint($"{i} - Saved JSON:{jsonFileName}");
+
+                        //look for either esc or e button depressed to exit
+                        if (Console.KeyAvailable)
+                        {
+                            var keyInfo = Console.ReadKey();
+                            if (keyInfo.Key == ConsoleKey.Escape || 
+                                keyInfo.Key == ConsoleKey.E || 
+                                keyInfo.Key == ConsoleKey.X)
+                            {
+                                LogAndPrint($"User pressed ESC or E. Exiting.");
+                                break;
+                            }
+                        }
                     }
                     LogAndPrint($"END LOOP - Procesed {i} records in the WorkQueue.");
                 }
